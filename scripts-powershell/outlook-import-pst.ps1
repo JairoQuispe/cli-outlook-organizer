@@ -53,7 +53,11 @@ param (
     [switch]$Headless,
 
     [Parameter(Mandatory=$false)]
-    [switch]$DeepDuplicateCheck
+    [switch]$DeepDuplicateCheck,
+
+    [Parameter(Mandatory=$false)]
+    [ValidateRange(0, 7200)]
+    [int]$DuplicateIndexInactivityTimeoutSec = 180
 )
 
 $ErrorActionPreference = "SilentlyContinue"
@@ -76,14 +80,14 @@ if ($Json -or $Headless) {
         )
         $msg = ($Object | ForEach-Object { "$_" }) -join " "
         $payload = @{ type = "log"; level = "info"; message = $msg }
-        if ($Json) { Write-Output ($payload | ConvertTo-Json -Compress -Depth 6) }
+        if ($Json) { [Console]::WriteLine(($payload | ConvertTo-Json -Compress -Depth 6)) }
     }
 
     function Write-Warning {
         param([Parameter(ValueFromRemainingArguments = $true)] [object[]]$Message)
         $msg = ($Message | ForEach-Object { "$_" }) -join " "
         $payload = @{ type = "log"; level = "warn"; message = $msg }
-        if ($Json) { Write-Output ($payload | ConvertTo-Json -Compress -Depth 6) }
+        if ($Json) { [Console]::WriteLine(($payload | ConvertTo-Json -Compress -Depth 6)) }
     }
 
     function Write-Progress {
@@ -108,7 +112,7 @@ if ($Json -or $Headless) {
             skipped = $Skipped
             failed = $Failed
         }
-        if ($Json) { Write-Output ($payload | ConvertTo-Json -Compress -Depth 6) }
+        if ($Json) { [Console]::WriteLine(($payload | ConvertTo-Json -Compress -Depth 6)) }
     }
 }
 
@@ -121,7 +125,7 @@ function Emit-Log {
     $timestamp = Get-LogTimestamp
     $payload = @{ type = "log"; level = $Level; message = $Message; timestamp = $timestamp }
     if ($Json) {
-        Write-Output ($payload | ConvertTo-Json -Compress -Depth 6)
+        [Console]::WriteLine(($payload | ConvertTo-Json -Compress -Depth 6))
     } else {
         Write-Host "[$timestamp] [$Level] $Message"
     }
@@ -131,7 +135,7 @@ function Emit-ErrorPayload {
     param([string]$Message)
     $payload = @{ type = "error"; message = $Message }
     if ($Json) {
-        Write-Output ($payload | ConvertTo-Json -Compress -Depth 6)
+        [Console]::WriteLine(($payload | ConvertTo-Json -Compress -Depth 6))
     } else {
         Write-Error $Message
     }
@@ -171,7 +175,7 @@ function Emit-ScanProgress {
     }
 
     if ($Json) {
-        Write-Output ($payload | ConvertTo-Json -Compress -Depth 6)
+        [Console]::WriteLine(($payload | ConvertTo-Json -Compress -Depth 6))
     } else {
         Write-Host ("[scan] {0}% {1}/{2} folder={3} items={4}" -f $percent, $scannedFolders, $totalFolders, $FolderPath, $CurrentItemCount)
     }
@@ -524,7 +528,7 @@ function Emit-ThrottleStats {
         throttleErrors = [int]$script:TokenBucket.throttleErrors
         adaptiveMultiplier = [double]([Math]::Round($script:TokenBucket.adaptiveMultiplier, 3))
     }
-    if ($Json) { Write-Output ($payload | ConvertTo-Json -Compress -Depth 6) }
+    if ($Json) { [Console]::WriteLine(($payload | ConvertTo-Json -Compress -Depth 6)) }
 }
 
 function Is-ThrottlingError {
@@ -876,10 +880,7 @@ function Get-DuplicateKeyFromRow {
         try { $d = $row["CreationTime"]; if ($d) { $dateStr = ([datetime]$d).ToString("yyyyMMddHHmmss") } } catch {}
     }
     $sender = "nosender"
-    try { $s = $row["http://schemas.microsoft.com/mapi/proptag/0x5D02001F"]; if ($s) { $sender = ([string]$s).Trim().ToLowerInvariant() } } catch {}
-    if ($sender -eq "nosender") {
-        try { $s = $row["http://schemas.microsoft.com/mapi/proptag/0x0039001F"]; if ($s) { $sender = ([string]$s).Trim().ToLowerInvariant() } } catch {}
-    }
+    try { $s = $row["http://schemas.microsoft.com/mapi/proptag/0x0039001F"]; if ($s) { $sender = ([string]$s).Trim().ToLowerInvariant() } } catch {}
 
     if ($dateStr -ne "nodate") {
         $subjectPart = if ($normalizedSubject) { $normalizedSubject } else { "(nosubject)" }
@@ -919,10 +920,7 @@ function Get-DuplicateKeyFromItem {
         try { $d = $item.CreationTime; if ($d) { $dateStr = ([datetime]$d).ToString("yyyyMMddHHmmss") } } catch {}
     }
     $sender = "nosender"
-    try { $s = $item.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x5D02001F"); if ($s) { $sender = ([string]$s).Trim().ToLowerInvariant() } } catch {}
-    if ($sender -eq "nosender") {
-        try { $s = $item.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x0039001F"); if ($s) { $sender = ([string]$s).Trim().ToLowerInvariant() } } catch {}
-    }
+    try { $s = $item.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x0039001F"); if ($s) { $sender = ([string]$s).Trim().ToLowerInvariant() } } catch {}
 
     if ($dateStr -ne "nodate") {
         $subjectPart = if ($normalizedSubject) { $normalizedSubject } else { "(nosubject)" }
@@ -934,35 +932,91 @@ function Get-DuplicateKeyFromItem {
 
 function Build-DuplicateIndexFromFolder {
     param($folder, [System.Collections.Generic.List[string]]$list)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $indexInactivityTimeout = [int]$DuplicateIndexInactivityTimeoutSec
+    $inactivityTimeoutEnabled = ($indexInactivityTimeout -gt 0)
+    $lastProgressAt = [DateTime]::UtcNow
+
+    if ($inactivityTimeoutEnabled) {
+        Emit-Log "info" "  Timeout por inactividad: ${indexInactivityTimeout}s"
+    } else {
+        Emit-Log "info" "  Timeout por inactividad deshabilitado"
+    }
+
+    # Strategy 1: Fast path using GetTable (batch reads)
     try {
-        $table = $folder.GetTable("")
+        $tableFilter = ""
+        if ($FilterOnlyYear) {
+            $tableFilter = "@SQL=""urn:schemas:httpmail:datereceived"" >= '01/01/$FilterOnlyYear' AND ""urn:schemas:httpmail:datereceived"" < '01/01/$([int]$FilterOnlyYear + 1)'"
+            Emit-Log "info" "  GetTable con filtro anio=$FilterOnlyYear..."
+        } else {
+            Emit-Log "info" "  GetTable iniciando..."
+        }
+        $table = $folder.GetTable($tableFilter)
+        Emit-Log "info" "  GetTable listo, configurando columnas..."
         $table.Columns.RemoveAll()
+        try { $table.Columns.Add("http://schemas.microsoft.com/mapi/proptag/0x1035001F") | Out-Null } catch {}
+        try { $table.Columns.Add("urn:schemas:mailheader:message-id") | Out-Null } catch {}
+        try { $table.Columns.Add("http://schemas.microsoft.com/mapi/proptag/0x300B0102") | Out-Null } catch {}
         try { $table.Columns.Add("Subject") | Out-Null } catch {}
         try { $table.Columns.Add("ReceivedTime") | Out-Null } catch {}
         try { $table.Columns.Add("SentOn") | Out-Null } catch {}
         try { $table.Columns.Add("CreationTime") | Out-Null } catch {}
         try { $table.Columns.Add("http://schemas.microsoft.com/mapi/proptag/0x0039001F") | Out-Null } catch {}
-        try { $table.Columns.Add("http://schemas.microsoft.com/mapi/proptag/0x5D02001F") | Out-Null } catch {}
-        try { $table.Columns.Add("http://schemas.microsoft.com/mapi/proptag/0x1035001F") | Out-Null } catch {}
-        try { $table.Columns.Add("urn:schemas:mailheader:message-id") | Out-Null } catch {}
-        try { $table.Columns.Add("http://schemas.microsoft.com/mapi/proptag/0x300B0102") | Out-Null } catch {}
-        while (-not $table.EndOfTable) {
-            $rows = $table.GetNextRows(500)
-            foreach ($row in $rows) {
-                try {
-                    $k = Get-DuplicateKeyFromRow -row $row
-                    if ($k) { $list.Add([string]$k) }
-                } catch {}
-            }
-        }
-        return
-    } catch {}
 
+        Emit-Log "info" "  Leyendo filas..."
+        $rowCount = 0
+        while (-not $table.EndOfTable) {
+            if ($inactivityTimeoutEnabled) {
+                $idleSec = ([DateTime]::UtcNow - $lastProgressAt).TotalSeconds
+                if ($idleSec -ge $indexInactivityTimeout) {
+                    Emit-Log "warn" "  Timeout por inactividad en indexacion (${indexInactivityTimeout}s), usando indice parcial ($($list.Count) claves)"
+                    return
+                }
+            }
+
+            $row = $table.GetNextRow()
+            $rowCount++
+            $lastProgressAt = [DateTime]::UtcNow
+
+            if ($rowCount % 500 -eq 0) {
+                Emit-Log "info" "  indexado $($list.Count) claves ($($sw.Elapsed.TotalSeconds.ToString('F0'))s)..."
+            }
+
+            try {
+                $k = Get-DuplicateKeyFromRow -row $row
+                if ($k) { $list.Add([string]$k) }
+            } catch {}
+        }
+        Emit-Log "info" "  Indexacion completa: $($list.Count) claves en $($sw.Elapsed.TotalSeconds.ToString('F1'))s"
+        return
+    } catch {
+        Emit-Log "warn" "GetTable fallo ($($sw.Elapsed.TotalSeconds.ToString('F0'))s): $($_.Exception.Message)"
+    }
+
+    # Strategy 2: Fallback item-by-item (slow but reliable)
     try {
+        $itemCount = 0
+        try { $itemCount = [int]$folder.Items.Count } catch {}
+        Emit-Log "warn" "Fallback: iterando $itemCount items individualmente..."
+        $idx = 0
+        $lastProgressAt = [DateTime]::UtcNow
         foreach ($it in $folder.Items) {
+            if ($inactivityTimeoutEnabled) {
+                $idleSec = ([DateTime]::UtcNow - $lastProgressAt).TotalSeconds
+                if ($idleSec -ge $indexInactivityTimeout) {
+                    Emit-Log "warn" "  Timeout por inactividad en fallback (${indexInactivityTimeout}s, $idx/$itemCount). Indice parcial: $($list.Count) claves"
+                    return
+                }
+            }
             $k = $null
             try { $k = Get-DuplicateKeyFromItem -item $it } catch {}
             if ($k) { $list.Add([string]$k) }
+            $idx++
+            $lastProgressAt = [DateTime]::UtcNow
+            if ($idx % 100 -eq 0) {
+                Emit-Log "info" "  fallback: $idx/$itemCount ($($sw.Elapsed.TotalSeconds.ToString('F0'))s)..."
+            }
         }
     } catch {}
 }
@@ -970,8 +1024,8 @@ function Build-DuplicateIndexFromFolder {
 function Build-DuplicateIndexRecursive {
     param($folder, [System.Collections.Generic.List[string]]$list)
     foreach ($sub in (Get-SubFolders-Safe -parentFolder $folder)) {
-        Build-DuplicateIndexFromFolder -folder $sub -list $list
-        Build-DuplicateIndexRecursive -folder $sub -list $list
+        $null = Build-DuplicateIndexFromFolder -folder $sub -list $list
+        $null = Build-DuplicateIndexRecursive -folder $sub -list $list
     }
 }
 
@@ -981,14 +1035,14 @@ function Build-DuplicateIndex {
     $folderId = $null
     try { $folderId = $targetFolder.EntryID } catch {}
     if ($folderId -and $script:DupIndexCache.ContainsKey($folderId)) {
-        return $script:DupIndexCache[$folderId]
+        return ,$script:DupIndexCache[$folderId]
     }
 
     $list = New-Object 'System.Collections.Generic.List[string]'
-    Build-DuplicateIndexFromFolder -folder $targetFolder -list $list
+    $null = Build-DuplicateIndexFromFolder -folder $targetFolder -list $list
 
     if ($Deep) {
-        Build-DuplicateIndexRecursive -folder $targetFolder -list $list
+        $null = Build-DuplicateIndexRecursive -folder $targetFolder -list $list
     }
 
     $readOnlySet = New-Object 'System.Collections.Generic.HashSet[string]'
@@ -1000,7 +1054,7 @@ function Build-DuplicateIndex {
         $script:DupIndexCache[$folderId] = $readOnlySet
     }
 
-    return $readOnlySet
+    return ,$readOnlySet
 }
 
 function Restore-FolderRecursive {
@@ -1087,7 +1141,7 @@ function Restore-FolderRecursive {
                             key = [string]$dupKey
                             source = $dupSource
                         }
-                        if ($Json) { Write-Output ($dupPayload | ConvertTo-Json -Compress -Depth 6) }
+                        if ($Json) { [Console]::WriteLine(($dupPayload | ConvertTo-Json -Compress -Depth 6)) }
                         else { Emit-Log "info" "Duplicado saltado [$dupSource]: $(Get-SafeSubject $item)" }
                         continue
                     }
@@ -1236,9 +1290,9 @@ if ($ListFolders) {
 
     Emit-ScanProgress -Phase "completed" -FolderPath "" -CurrentItemCount 0 -FolderCompleted
 
-    Write-Output (@{ type = "folders"; count = @($flat.Value).Count } | ConvertTo-Json -Compress -Depth 6)
+    [Console]::WriteLine((@{ type = "folders"; count = @($flat.Value).Count } | ConvertTo-Json -Compress -Depth 6))
     foreach ($f in $flat.Value) {
-        Write-Output ($f | ConvertTo-Json -Compress -Depth 6)
+        [Console]::WriteLine(($f | ConvertTo-Json -Compress -Depth 6))
     }
 
     if (-not $alreadyMounted) {
@@ -1311,5 +1365,5 @@ $payload = @{
     totalWaitedMs = [long]$script:TokenBucket.totalWaitedMs
     failures = @($stats.Value.failures)
 }
-Write-Output ($payload | ConvertTo-Json -Compress -Depth 10 -WarningAction SilentlyContinue)
+[Console]::WriteLine(($payload | ConvertTo-Json -Compress -Depth 10 -WarningAction SilentlyContinue))
 exit 0
