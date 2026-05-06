@@ -114,13 +114,28 @@ fn askPstFolders(allocator: std.mem.Allocator, pst_path: []const u8) ![][]u8 {
     };
     defer allocator.free(idxs);
 
-    var out = try allocator.alloc([]u8, idxs.len);
+    // Filter: only pass folders that have items (count > 0) to the import.
+    // Empty structural folders are shown in tree for navigation but not imported directly.
+    var valid_count: usize = 0;
+    for (idxs) |idx| {
+        if (folders[idx].item_count > 0) valid_count += 1;
+    }
+    if (valid_count == 0) {
+        std.debug.print("\x1b[33m[!] Ninguna carpeta seleccionada contiene correos.\x1b[0m\n", .{});
+        return error.NoFoldersFound;
+    }
+
+    var out = try allocator.alloc([]u8, valid_count);
     errdefer {
         for (out[0..]) |p| allocator.free(p);
         allocator.free(out);
     }
-    for (idxs, 0..) |idx, j| {
-        out[j] = try allocator.dupe(u8, folders[idx].path);
+    var j: usize = 0;
+    for (idxs) |idx| {
+        if (folders[idx].item_count > 0) {
+            out[j] = try allocator.dupe(u8, folders[idx].path);
+            j += 1;
+        }
     }
     return out;
 }
@@ -248,15 +263,11 @@ fn listPstFolders(allocator: std.mem.Allocator, pst_path: []const u8) ![]PstFold
                                     break :blk try std.fmt.allocPrint(allocator, "Años: sin_fecha({d})", .{undated_count});
                                 };
 
-                                if (count == 0) {
-                                    if (year_summary) |ys| allocator.free(ys);
-                                } else {
-                                    try list.append(allocator, .{
-                                        .path = try allocator.dupe(u8, path_val.?.string),
-                                        .item_count = count,
-                                        .year_summary = year_summary,
-                                    });
-                                }
+                                try list.append(allocator, .{
+                                    .path = try allocator.dupe(u8, path_val.?.string),
+                                    .item_count = count,
+                                    .year_summary = year_summary,
+                                });
                             }
                         }
                     }
@@ -295,15 +306,11 @@ fn listPstFolders(allocator: std.mem.Allocator, pst_path: []const u8) ![]PstFold
                                 break :blk try std.fmt.allocPrint(allocator, "Años: sin_fecha({d})", .{undated_count});
                             };
 
-                            if (count == 0) {
-                                if (year_summary) |ys| allocator.free(ys);
-                            } else {
-                                try list.append(allocator, .{
-                                    .path = try allocator.dupe(u8, path_val.?.string),
-                                    .item_count = count,
-                                    .year_summary = year_summary,
-                                });
-                            }
+                            try list.append(allocator, .{
+                                .path = try allocator.dupe(u8, path_val.?.string),
+                                .item_count = count,
+                                .year_summary = year_summary,
+                            });
                         }
                     }
                 }

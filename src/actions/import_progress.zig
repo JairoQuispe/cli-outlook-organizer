@@ -104,7 +104,7 @@ pub fn run(allocator: std.mem.Allocator, child: *std.process.Child, header: Head
 
     var waited = false;
 
-    while (true) {
+    main_loop: while (true) {
         const ev = backend.interface().pollEvent(50) catch tui.Event.none;
         switch (ev) {
             .key => |k| {
@@ -122,14 +122,14 @@ pub fn run(allocator: std.mem.Allocator, child: *std.process.Child, header: Head
                         state.mutex.lock();
                         const finished = state.finished;
                         state.mutex.unlock();
-                        if (finished) break;
+                        if (finished) break :main_loop;
                     },
                     .char => |c| {
                         if (c == 'q' or c == 'Q') {
                             state.mutex.lock();
                             const finished = state.finished;
                             state.mutex.unlock();
-                            if (finished) break;
+                            if (finished) break :main_loop;
                         }
                     },
                     else => {},
@@ -258,6 +258,12 @@ fn parseAndApply(line: []const u8, state: *State, allocator: std.mem.Allocator) 
         else
             .info;
         state.pushLog(lvl, message);
+        // Update activity text during pre-import phases so UI doesn't stay on "Iniciando..."
+        if (state.percent == 0 and lvl == .info and message.len > 0) {
+            if (containsAny(message, &.{ "Indexando", "Contando", "Pre-indexando", "Total ", "Montando", "destino:" })) {
+                state.setActivity("Preparando...");
+            }
+        }
     } else if (std.mem.eql(u8, type_str, "progress")) {
         if (strField(root, "activity")) |a| state.setActivity(a);
         if (strField(root, "status")) |s| state.setStatus(s);
@@ -309,6 +315,13 @@ fn floatField(obj: std.json.ObjectMap, key: []const u8) ?f64 {
         .integer => |i| @floatFromInt(i),
         else => null,
     };
+}
+
+fn containsAny(haystack: []const u8, needles: []const []const u8) bool {
+    for (needles) |needle| {
+        if (std.mem.indexOf(u8, haystack, needle) != null) return true;
+    }
+    return false;
 }
 
 // ── Render ────────────────────────────────────────────────────────

@@ -480,6 +480,8 @@ $script:TokenBucket = @{
 }
 
 $script:DupIndexCache = New-Object 'System.Collections.Generic.Dictionary[string, System.Collections.Generic.HashSet[string]]'
+$script:RuntimeDupKeys = New-Object 'System.Collections.Generic.HashSet[string]'
+$script:ChildFolderCache = New-Object 'System.Collections.Generic.Dictionary[string, System.Collections.Generic.Dictionary[string, object]]'
 
 function Wait-ForToken {
     while ($true) {
@@ -528,8 +530,19 @@ function Emit-ThrottleStats {
 function Is-ThrottlingError {
     param($errorRecord)
     $msg = "$errorRecord"
-    if ($msg -match "0x80040115" -or $msg -match "0x8004011D") { return $true }
+    # Hex HRESULT codes in error text
+    if ($msg -match "0x80040115" -or $msg -match "0x8004011D" -or $msg -match "0x80040600") { return $true }
+    # English patterns
     if ($msg -match "Server Busy" -or $msg -match "throttl" -or $msg -match "budget" -or $msg -match "too many requests" -or $msg -match "429") { return $true }
+    # Spanish MAPI network/connection errors (locale-dependent messages from Outlook COM)
+    if ($msg -match "problemas en la red" -or $msg -match "conexi.n con Microsoft Exchange" -or $msg -match "no se puede completar") { return $true }
+    # Generic network/disconnection patterns
+    if ($msg -match "network" -or $msg -match "disconnected" -or $msg -match "connection.*lost" -or $msg -match "RPC_E_DISCONNECTED") { return $true }
+    # Check numeric HResult on the exception object
+    try {
+        $hr = $errorRecord.Exception.HResult
+        if ($hr -eq [int]0x80040115 -or $hr -eq [int]0x8004011D -or $hr -eq [int]0x80040600 -or $hr -eq [int]0x800401FD) { return $true }
+    } catch {}
     return $false
 }
 
@@ -552,9 +565,19 @@ function Invoke-WithRetry {
                 $MaxBackoffMs
             )
             $delay = [int]$delay
-            Emit-Log "warn" "Throttling en $OperationName, backoff ${delay}ms (intento $($attempt+1)/$MaxRetries): $($_.Exception.Message)"
+            # Network/MAPI disconnection errors need longer cooldown for reconnection
+            $errMsg = "$($_.Exception.Message)"
+            $isNetworkDrop = ($errMsg -match "problemas en la red" -or $errMsg -match "network" -or $errMsg -match "conexi.n con Microsoft Exchange" -or $errMsg -match "disconnected")
+            if ($isNetworkDrop) {
+                $delay = [Math]::Max($delay, 5000)
+                $delay = [Math]::Min([int]($delay * 1.5), 60000)
+                Emit-Log "warn" "Red/MAPI desconectado en $OperationName, esperando ${delay}ms para reconexión (intento $($attempt+1)/$MaxRetries): $errMsg"
+            } else {
+                Emit-Log "warn" "Throttling en $OperationName, backoff ${delay}ms (intento $($attempt+1)/$MaxRetries): $errMsg"
+            }
             if ($AdaptiveThrottling) {
-                $script:TokenBucket.adaptiveMultiplier = [Math]::Max(0.1, $script:TokenBucket.adaptiveMultiplier * 0.7)
+                $factor = if ($isNetworkDrop) { 0.5 } else { 0.7 }
+                $script:TokenBucket.adaptiveMultiplier = [Math]::Max(0.1, $script:TokenBucket.adaptiveMultiplier * $factor)
                 $newRate = [int]($script:TokenBucket.refillRate * $script:TokenBucket.adaptiveMultiplier * 60.0)
                 Emit-Log "info" "Adaptive throttling: nueva tasa efectiva ~${newRate} items/min"
             }
@@ -602,12 +625,111 @@ function Get-SubFolders-Safe {
     try { return $parentFolder.Folders } catch { return @() }
 }
 
+function Normalize-FolderName {
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return "" }
+
+    $v = $Name
+    try { $v = $v.Normalize([Text.NormalizationForm]::FormKC) } catch {}
+    # Remove zero-width chars, BOM, soft-hyphen, non-breaking spaces
+    $v = [regex]::Replace($v, "[\u00AD\u200B-\u200F\u2028-\u202F\uFEFF\u00A0]", "")
+    $v = [regex]::Replace($v, "\s+", " ")
+    $v = $v.Trim().ToLowerInvariant()
+    return $v
+}
+
+function Sanitize-FolderName {
+    param([string]$Name)
+
+    if ($null -eq $Name) { return "" }
+    $v = [string]$Name
+    $v = [regex]::Replace($v, "[\u00AD\u200B-\u200F\u2028-\u202F\uFEFF\u00A0]", "")
+    $v = [regex]::Replace($v, "\s+", " ").Trim()
+    if ([string]::IsNullOrWhiteSpace($v)) { return "(Sin nombre)" }
+    return $v
+}
+
+function Get-ParentCacheKey {
+    param($folder)
+    try {
+        $eid = $folder.EntryID
+        if ($eid) { return $eid }
+    } catch {}
+    try {
+        $sid = $folder.StoreID
+        $path = $folder.FolderPath
+        if ($sid -and $path) { return "$sid|$path" }
+    } catch {}
+    return $null
+}
+
+function Index-ChildFolders {
+    param($parent)
+
+    $cacheKey = Get-ParentCacheKey -folder $parent
+    if ($cacheKey -and $script:ChildFolderCache.ContainsKey($cacheKey)) {
+        return $script:ChildFolderCache[$cacheKey]
+    }
+
+    $index = New-Object 'System.Collections.Generic.Dictionary[string, object]'
+    foreach ($f in (Get-SubFolders-Safe -parentFolder $parent)) {
+        $childName = $null
+        try { $childName = [string]$f.Name } catch { continue }
+        $norm = Normalize-FolderName $childName
+        if (-not [string]::IsNullOrWhiteSpace($norm) -and -not $index.ContainsKey($norm)) {
+            $index[$norm] = $f
+        }
+    }
+
+    if ($cacheKey) {
+        $script:ChildFolderCache[$cacheKey] = $index
+    }
+    return $index
+}
+
 function Ensure-ChildFolder {
     param($parent, [string]$Name)
-    foreach ($f in (Get-SubFolders-Safe -parentFolder $parent)) {
-        if ($f.Name -ieq $Name) { return $f }
+
+    $safeName = Sanitize-FolderName $Name
+    $targetNorm = Normalize-FolderName $safeName
+
+    if ([string]::IsNullOrWhiteSpace($targetNorm)) {
+        $safeName = "(Sin nombre)"
+        $targetNorm = Normalize-FolderName $safeName
     }
-    return $parent.Folders.Add($Name)
+
+    $index = Index-ChildFolders -parent $parent
+
+    if ($index.ContainsKey($targetNorm)) {
+        Emit-Log "info" "Reutilizando carpeta existente: $safeName"
+        return $index[$targetNorm]
+    }
+
+    # Double-check: re-enumerate live COM collection as final fallback
+    # (handles rare case where cache was built before a sibling add)
+    foreach ($f in (Get-SubFolders-Safe -parentFolder $parent)) {
+        $childName = $null
+        try { $childName = [string]$f.Name } catch { continue }
+        $norm = Normalize-FolderName $childName
+        if ($norm -eq $targetNorm) {
+            $index[$norm] = $f
+            Emit-Log "info" "Reutilizando carpeta existente (re-scan): $safeName"
+            return $f
+        }
+    }
+
+    Emit-Log "info" "Creando carpeta nueva: $safeName"
+    $created = $parent.Folders.Add($safeName)
+    $index[$targetNorm] = $created
+
+    # Invalidate parent cache to force re-index on next sibling query
+    $cacheKey = Get-ParentCacheKey -folder $parent
+    if ($cacheKey) {
+        $script:ChildFolderCache[$cacheKey] = $index
+    }
+
+    return $created
 }
 
 function Resolve-TargetTopFolder {
@@ -617,7 +739,7 @@ function Resolve-TargetTopFolder {
         [string]$SourceTopName
     )
 
-    $n = ($SourceTopName.Trim().ToLowerInvariant())
+    $n = Normalize-FolderName $SourceTopName
 
     # OlDefaultFolders (valores COM)
     # 3=DeletedItems, 4=Outbox, 5=SentMail, 6=Inbox, 16=Drafts, 23=Junk
@@ -750,13 +872,18 @@ function Get-DuplicateKeyFromRow {
     if ($dateStr -eq "nodate") {
         try { $d = $row["SentOn"]; if ($d) { $dateStr = ([datetime]$d).ToString("yyyyMMddHHmmss") } } catch {}
     }
+    if ($dateStr -eq "nodate") {
+        try { $d = $row["CreationTime"]; if ($d) { $dateStr = ([datetime]$d).ToString("yyyyMMddHHmmss") } } catch {}
+    }
     $sender = "nosender"
-    try { $s = $row["http://schemas.microsoft.com/mapi/proptag/0x0065001F"]; if ($s) { $sender = ([string]$s).ToLowerInvariant() } } catch {}
-    $sz = "nosz"
-    try { $v = $row["Size"]; if ($null -ne $v) { $sz = "$([long]$v)" } } catch {}
+    try { $s = $row["http://schemas.microsoft.com/mapi/proptag/0x5D02001F"]; if ($s) { $sender = ([string]$s).Trim().ToLowerInvariant() } } catch {}
+    if ($sender -eq "nosender") {
+        try { $s = $row["http://schemas.microsoft.com/mapi/proptag/0x0039001F"]; if ($s) { $sender = ([string]$s).Trim().ToLowerInvariant() } } catch {}
+    }
 
-    if ($normalizedSubject -and $dateStr -ne "nodate") {
-        return "comp:$normalizedSubject|$dateStr|$sender|$sz"
+    if ($dateStr -ne "nodate") {
+        $subjectPart = if ($normalizedSubject) { $normalizedSubject } else { "(nosubject)" }
+        return "comp:$subjectPart|$dateStr|$sender"
     }
 
     return $null
@@ -788,13 +915,18 @@ function Get-DuplicateKeyFromItem {
     if ($dateStr -eq "nodate") {
         try { $d = $item.SentOn; if ($d) { $dateStr = ([datetime]$d).ToString("yyyyMMddHHmmss") } } catch {}
     }
+    if ($dateStr -eq "nodate") {
+        try { $d = $item.CreationTime; if ($d) { $dateStr = ([datetime]$d).ToString("yyyyMMddHHmmss") } } catch {}
+    }
     $sender = "nosender"
-    try { $s = $item.SenderEmailAddress; if ($s) { $sender = ([string]$s).ToLowerInvariant() } } catch {}
-    $sz = "nosz"
-    try { $v = [long]$item.Size; if ($v -ge 0) { $sz = "$v" } } catch {}
+    try { $s = $item.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x5D02001F"); if ($s) { $sender = ([string]$s).Trim().ToLowerInvariant() } } catch {}
+    if ($sender -eq "nosender") {
+        try { $s = $item.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x0039001F"); if ($s) { $sender = ([string]$s).Trim().ToLowerInvariant() } } catch {}
+    }
 
-    if ($normalizedSubject -and $dateStr -ne "nodate") {
-        return "comp:$normalizedSubject|$dateStr|$sender|$sz"
+    if ($dateStr -ne "nodate") {
+        $subjectPart = if ($normalizedSubject) { $normalizedSubject } else { "(nosubject)" }
+        return "comp:$subjectPart|$dateStr|$sender"
     }
 
     return $null
@@ -806,19 +938,22 @@ function Build-DuplicateIndexFromFolder {
         $table = $folder.GetTable("")
         $table.Columns.RemoveAll()
         try { $table.Columns.Add("Subject") | Out-Null } catch {}
-        try { $table.Columns.Add("Size") | Out-Null } catch {}
         try { $table.Columns.Add("ReceivedTime") | Out-Null } catch {}
         try { $table.Columns.Add("SentOn") | Out-Null } catch {}
-        try { $table.Columns.Add("http://schemas.microsoft.com/mapi/proptag/0x0065001F") | Out-Null } catch {}
+        try { $table.Columns.Add("CreationTime") | Out-Null } catch {}
+        try { $table.Columns.Add("http://schemas.microsoft.com/mapi/proptag/0x0039001F") | Out-Null } catch {}
+        try { $table.Columns.Add("http://schemas.microsoft.com/mapi/proptag/0x5D02001F") | Out-Null } catch {}
         try { $table.Columns.Add("http://schemas.microsoft.com/mapi/proptag/0x1035001F") | Out-Null } catch {}
         try { $table.Columns.Add("urn:schemas:mailheader:message-id") | Out-Null } catch {}
         try { $table.Columns.Add("http://schemas.microsoft.com/mapi/proptag/0x300B0102") | Out-Null } catch {}
         while (-not $table.EndOfTable) {
-            $row = $table.GetNextRow()
-            try {
-                $k = Get-DuplicateKeyFromRow -row $row
-                if ($k) { $list.Add([string]$k) }
-            } catch {}
+            $rows = $table.GetNextRows(500)
+            foreach ($row in $rows) {
+                try {
+                    $k = Get-DuplicateKeyFromRow -row $row
+                    if ($k) { $list.Add([string]$k) }
+                } catch {}
+            }
         }
         return
     } catch {}
@@ -885,12 +1020,10 @@ function Restore-FolderRecursive {
     }
 
     $existingKeys = $null
-    $runtimeDupKeys = $null
     if ($SkipDuplicates) {
         Emit-Log "info" "Indexando duplicados en: $folderPath"
         $existingKeys = Build-DuplicateIndex -targetFolder $destFolder -Deep:$DeepDuplicateCheck
-        $runtimeDupKeys = New-Object 'System.Collections.Generic.HashSet[string]'
-        Emit-Log "info" "Indice inicial: $($existingKeys.Count) claves existentes$(if ($DeepDuplicateCheck) { ' (deep)' })"
+        Emit-Log "info" "Indice inicial: $($existingKeys.Count) claves existentes + $($script:RuntimeDupKeys.Count) runtime$(if ($DeepDuplicateCheck) { ' (deep)' })"
     }
 
     $items = $sourceFolder.Items
@@ -904,6 +1037,8 @@ function Restore-FolderRecursive {
             $item = $null
             try { $item = $items.Item($i) } catch { continue }
             if (-not $item) { continue }
+
+            $itemDate = $null
 
             if ($FilterOnlyYear) {
                 $itemDate = $null
@@ -931,15 +1066,15 @@ function Restore-FolderRecursive {
             }
 
             $dupKey = $null
-            if ($existingKeys -or $runtimeDupKeys) {
+            if ($existingKeys) {
                 $dupKey = Get-DuplicateKeyFromItem -item $item
                 if ($dupKey) {
                     $isDup = $false
                     $dupSource = $null
-                    if ($existingKeys -and $existingKeys.Contains([string]$dupKey)) {
+                    if ($existingKeys.Contains([string]$dupKey)) {
                         $isDup = $true
                         $dupSource = "existing"
-                    } elseif ($runtimeDupKeys -and $runtimeDupKeys.Contains([string]$dupKey)) {
+                    } elseif ($script:RuntimeDupKeys.Contains([string]$dupKey)) {
                         $isDup = $true
                         $dupSource = "batch"
                     }
@@ -989,10 +1124,11 @@ function Restore-FolderRecursive {
                     }
                 }
                 if ($Action -ieq "Move") { $stats.Value.moved++ } else { $stats.Value.copied++ }
-                if ($runtimeDupKeys -and $dupKey) {
-                    try {
-                        [void]$runtimeDupKeys.Add([string]$dupKey)
-                    } catch {
+                if ($dupKey) {
+                    [void]$script:RuntimeDupKeys.Add([string]$dupKey)
+                    # Update folder cache so subsequent calls see this key
+                    if ($existingKeys) {
+                        [void]$existingKeys.Add([string]$dupKey)
                     }
                 }
             } catch {
@@ -1020,8 +1156,20 @@ function Restore-FolderRecursive {
         }
     }
 
+    # Pre-index destination children BEFORE iterating source subfolders
+    # This ensures all existing dest subfolders are in cache before any .Add() calls
+    [void](Index-ChildFolders -parent $destFolder)
+
+    # Snapshot source subfolders into array to avoid COM enumerator invalidation
+    $sourceSubFolders = @()
     foreach ($sub in (Get-SubFolders-Safe -parentFolder $sourceFolder)) {
-        $destSub = Ensure-ChildFolder -parent $destFolder -Name $sub.Name
+        $sourceSubFolders += $sub
+    }
+
+    foreach ($sub in $sourceSubFolders) {
+        $subName = $null
+        try { $subName = [string]$sub.Name } catch { continue }
+        $destSub = Ensure-ChildFolder -parent $destFolder -Name $subName
         Restore-FolderRecursive -sourceFolder $sub -destFolder $destSub -pathPrefix $folderPath -stats $stats
     }
 }
@@ -1130,6 +1278,10 @@ $stats = [ref]@{
 
 $startTime = [DateTime]::UtcNow
 $targetRoot = $targetStore.GetRootFolder()
+
+# Pre-index all existing top-level folders in target to avoid duplicates
+Emit-Log "info" "Pre-indexando carpetas destino..."
+[void](Index-ChildFolders -parent $targetRoot)
 
 foreach ($sourceTop in (Get-SubFolders-Safe -parentFolder $pstRoot)) {
     $destTop = Resolve-TargetTopFolder -targetStore $targetStore -targetRoot $targetRoot -SourceTopName $sourceTop.Name

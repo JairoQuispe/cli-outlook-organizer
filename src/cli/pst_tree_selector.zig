@@ -62,9 +62,8 @@ const View = struct {
             try insertFolderPath(allocator, root, f, idx);
         }
 
-        for (root.children.items) |child| {
-            child.expanded = true;
-        }
+        // Auto-expand all levels so the full hierarchy is visible
+        expandAllRecursive(root);
 
         view.rebuildVisible();
         return view;
@@ -143,8 +142,29 @@ const View = struct {
 
     fn toggleCurrentSelected(self: *View) void {
         const node = self.selectedNode() orelse return;
+        // If node has children, toggle the entire subtree
+        if (node.children.items.len > 0) {
+            const new_state = !isSubtreeFullySelected(node);
+            setSubtreeSelected(node, new_state);
+            return;
+        }
+        // Leaf node: toggle individually
         if (node.folder_index == null) return;
         node.selected = !node.selected;
+    }
+
+    fn expandAll(self: *View) void {
+        expandAllRecursive(self.root);
+        self.rebuildVisible();
+    }
+
+    fn collapseAll(self: *View) void {
+        collapseAllRecursive(self.root);
+        // Keep first-level expanded for usability
+        for (self.root.children.items) |child| {
+            child.expanded = true;
+        }
+        self.rebuildVisible();
     }
 
     fn clearAllSelections(self: *View) void {
@@ -229,6 +249,8 @@ pub fn select(allocator: std.mem.Allocator, folders: []const FolderEntry) !?[]us
                     ' ' => view.toggleCurrentSelected(),
                     'a', 'A' => view.selectAll(),
                     'n', 'N' => view.clearAllSelections(),
+                    'e', 'E' => view.expandAll(),
+                    'c', 'C' => view.collapseAll(),
                     else => {
                         if (c >= '1' and c <= '9') {
                             const n: usize = c - '0';
@@ -307,6 +329,45 @@ fn markSelectedRecursive(node: *Node, picked: []bool) void {
     }
 }
 
+fn expandAllRecursive(node: *Node) void {
+    node.expanded = true;
+    for (node.children.items) |c| {
+        expandAllRecursive(c);
+    }
+}
+
+fn collapseAllRecursive(node: *Node) void {
+    node.expanded = false;
+    for (node.children.items) |c| {
+        collapseAllRecursive(c);
+    }
+}
+
+fn isSubtreeFullySelected(node: *Node) bool {
+    if (node.folder_index != null and !node.selected) return false;
+    for (node.children.items) |c| {
+        if (!isSubtreeFullySelected(c)) return false;
+    }
+    return true;
+}
+
+fn setSubtreeSelected(node: *Node, state: bool) void {
+    if (node.folder_index != null) {
+        node.selected = state;
+    }
+    for (node.children.items) |c| {
+        setSubtreeSelected(c, state);
+    }
+}
+
+fn countDescendantItems(node: *Node) usize {
+    var total: usize = node.item_count;
+    for (node.children.items) |c| {
+        total += countDescendantItems(c);
+    }
+    return total;
+}
+
 fn render(view: *View, buf: *tui.Buffer) anyerror!void {
     _ = view.frame_arena.reset(.retain_capacity);
     const arena = view.frame_arena.allocator();
@@ -337,7 +398,7 @@ fn render(view: *View, buf: *tui.Buffer) anyerror!void {
     buf.setStringTruncated(
         inner.x,
         inner.y,
-        "Arriba/Abajo: mover | Izq/Der: contraer/expandir | Espacio: marcar | A: todas | N: ninguna | Enter: confirmar",
+        "Up/Down:mover | Izq/Der:nivel | Espacio:marcar | A:todas N:ninguna | E:expandir C:colapsar | Enter:OK",
         inner.width,
         .{ .fg = .gray },
     );
@@ -398,12 +459,25 @@ fn buildTreeNode(allocator: std.mem.Allocator, node: *Node) !tui.widgets.TreeNod
 fn buildLabel(allocator: std.mem.Allocator, node: *Node) ![]const u8 {
     if (node.folder_index != null) {
         const mark = if (node.selected) "[x]" else "[ ]";
+        // Parent folder with children: show subtree total
+        if (node.children.items.len > 0) {
+            const subtotal = countDescendantItems(node);
+            if (node.year_summary) |ys| {
+                return try std.fmt.allocPrint(allocator, "{s} {s} ({d} | total:{d}) - {s}", .{ mark, node.segment, node.item_count, subtotal, ys });
+            }
+            return try std.fmt.allocPrint(allocator, "{s} {s} ({d} | total:{d})", .{ mark, node.segment, node.item_count, subtotal });
+        }
         if (node.year_summary) |ys| {
             return try std.fmt.allocPrint(allocator, "{s} {s} ({d}) - {s}", .{ mark, node.segment, node.item_count, ys });
         }
         return try std.fmt.allocPrint(allocator, "{s} {s} ({d})", .{ mark, node.segment, node.item_count });
     }
 
+    // Structural node without folder_index (intermediate path segment not in PST output)
+    if (node.children.items.len > 0) {
+        const subtotal = countDescendantItems(node);
+        return try std.fmt.allocPrint(allocator, "    {s} (total:{d})", .{ node.segment, subtotal });
+    }
     return try std.fmt.allocPrint(allocator, "    {s}", .{node.segment});
 }
 
