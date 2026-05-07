@@ -1,0 +1,28 @@
+{
+  "name": "cli-outlook-organizer",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "outlook-organizer": "./dist/outlook-organizer.exe"
+  },
+  "scripts": {
+    "dev": "bun run src/index.tsx",
+    "build": "bun run build:exe",
+    "build:exe": "bun build ./src/index.tsx --compile --minify --sourcemap=none --no-compile-autoload-dotenv --no-compile-autoload-bunfig --no-compile-autoload-tsconfig --no-compile-autoload-package-json --outfile ./dist/outlook-organizer.exe",
+    "build:bundle": "bun build ./src/index.tsx --target=bun --minify --sourcemap=none --outdir ./dist/bundle",
+    "size": "bun -e \"const fs=require('node:fs');const path=require('node:path');function walk(d){for(const n of fs.readdirSync(d)){const p=path.join(d,n);const s=fs.statSync(p);if(s.isDirectory())walk(p);else console.log(p+' '+(s.size/1048576).toFixed(3)+' MB')}}walk('dist')\"",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "dependencies": {
+    "@opentui/core": "latest",
+    "@opentui/keymap": "latest",
+    "@opentui/react": "latest",
+    "react": "latest"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/react": "^19.2.14",
+    "typescript": "latest"
+  }
+}
